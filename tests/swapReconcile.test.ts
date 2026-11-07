@@ -1,4 +1,9 @@
-import { describe, expect, it } from "vitest"
+import { describe, expect, it, vi } from "vitest"
+
+vi.mock("~lib/prover", () => ({
+  assetIdForMint: vi.fn(async (m: string) => m),
+  NATIVE_ASSET_HEX: "00".repeat(32)
+}))
 
 import {
   classifyStrand,
@@ -102,5 +107,37 @@ describe("isNativeSolOutput", () => {
 
   it("treats USDC (any SPL mint) as NOT native SOL", () => {
     expect(isNativeSolOutput("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v")).toBe(false)
+  })
+})
+
+describe("routeSwap validation and slippage forwarding", () => {
+  it("forwards slippage_bps and validates router response payload", async () => {
+    const { routeSwap } = await import("../lib/paraloom/privateSwap")
+    const calls: { url: string; body: Record<string, unknown> }[] = []
+    const origFetch = globalThis.fetch
+    try {
+      globalThis.fetch = (async (url: string, init?: RequestInit) => {
+        calls.push({ url, body: JSON.parse(String(init?.body ?? "{}")) })
+        return new Response(
+          JSON.stringify({ out_amount: 123_456, swap_transaction: "AQ==" }),
+          { status: 200 }
+        )
+      }) as typeof fetch
+
+      const quote = await routeSwap("FreshPub111", "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", 5_000_000n, "SOL", 250)
+      expect(quote).toEqual({ out_amount: 123_456, swap_transaction: "AQ==" })
+      expect(calls).toHaveLength(1)
+      expect(calls[0].body.slippage_bps).toBe(250)
+      expect(calls[0].body.amount).toBe(5_000_000)
+
+      await expect(
+        routeSwap("FreshPub111", "SOL", 0n, "SOL", 100)
+      ).rejects.toThrow(/safe integer/)
+      await expect(
+        routeSwap("FreshPub111", "SOL", 1_000n, "SOL", 0)
+      ).rejects.toThrow(/slippageBps/)
+    } finally {
+      globalThis.fetch = origFetch
+    }
   })
 })
