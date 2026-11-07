@@ -1,4 +1,11 @@
-import { describe, expect, it } from "vitest"
+import { beforeEach, describe, expect, it, vi } from "vitest"
+import { Keypair } from "@solana/web3.js"
+import { installFakeChrome } from "./support/chromeStorage"
+
+vi.mock("~lib/prover", () => ({
+  assetIdForMint: vi.fn(async (m: string) => m.slice(0, 64).padEnd(64, "a")),
+  NATIVE_ASSET_HEX: "00".repeat(32)
+}))
 
 import {
   classifyStrand,
@@ -102,5 +109,95 @@ describe("isNativeSolOutput", () => {
 
   it("treats USDC (any SPL mint) as NOT native SOL", () => {
     expect(isNativeSolOutput("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v")).toBe(false)
+  })
+})
+
+describe("reconcileSwapOutputs & reshieldRecovery hardening", () => {
+  beforeEach(() => {
+    installFakeChrome()
+  })
+
+  it("validates persistReshieldedNote fields and skips WSOL_MINT in recoverReshields", async () => {
+    const { persistReshieldedNote, recoverReshields } = await import(
+      "../lib/paraloom/reshieldRecovery"
+    )
+    const { saveSwapOutput } = await import("../lib/paraloom/swapOutputs")
+    const account = "paraloom1" + "11".repeat(64)
+
+    await expect(
+      persistReshieldedNote(account, {
+        assetId: "ab".repeat(32),
+        mint: "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+        amount: "0",
+        blindingHex: "cd".repeat(32),
+        depositSignature: "sig-1"
+      })
+    ).rejects.toThrow(/amount must be > 0/)
+
+    await expect(
+      persistReshieldedNote(account, {
+        assetId: "not-hex",
+        mint: "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+        amount: "1000",
+        blindingHex: "cd".repeat(32),
+        depositSignature: "sig-1"
+      })
+    ).rejects.toThrow(/blindingHex or assetId/)
+
+    const kp = Keypair.generate()
+    await saveSwapOutput({
+      freshAddress: kp.publicKey.toBase58(),
+      freshSecretKeyHex: Buffer.from(kp.secretKey).toString("hex"),
+      outputMint: WSOL_MINT,
+      outAmount: 10_000_000,
+      swapSignature: "sig-wsol",
+      reshield: true,
+      createdAt: 1000
+    })
+
+    const fakeConn = {
+      getSignaturesForAddress: vi.fn()
+    } as never
+    expect(await recoverReshields(fakeConn, account)).toBe(0)
+    expect(
+      (fakeConn as { getSignaturesForAddress: ReturnType<typeof vi.fn> }).getSignaturesForAddress
+    ).not.toHaveBeenCalled()
+  })
+
+  it("reconcileSwapOutputs skips malformed freshAddress rows and ignores failed on-chain signatures", async () => {
+    const { reconcileSwapOutputs } = await import("../lib/paraloom/swapReconcile")
+    const { listSwapOutputs, saveSwapOutput } = await import("../lib/paraloom/swapOutputs")
+    const kp = Keypair.generate()
+
+    await saveSwapOutput({
+      freshAddress: "not-a-valid-pubkey",
+      freshSecretKeyHex: "00".repeat(64),
+      outputMint: "SOL",
+      outAmount: 0,
+      swapSignature: "",
+      createdAt: 1
+    })
+    await saveSwapOutput({
+      freshAddress: kp.publicKey.toBase58(),
+      freshSecretKeyHex: Buffer.from(kp.secretKey).toString("hex"),
+      outputMint: WSOL_MINT,
+      outAmount: 0,
+      swapSignature: "",
+      createdAt: 1
+    })
+
+    const fakeConn = {
+      getBalance: vi.fn(async () => Number(RESUME_MIN_LAMPORTS + 5_000_000n)),
+      getSignaturesForAddress: vi.fn(async () => [
+        { signature: "sig-failed", err: { InstructionError: [0, "Custom"] } },
+        { signature: "sig-confirmed-ok", err: null }
+      ])
+    } as never
+
+    const resolved = await reconcileSwapOutputs(fakeConn, "paraloom1" + "22".repeat(64))
+    expect(resolved).toBe(1)
+    const rows = await listSwapOutputs()
+    const updated = rows.find((r) => r.freshAddress === kp.publicKey.toBase58())
+    expect(updated?.swapSignature).toBe("sig-confirmed-ok")
   })
 })
